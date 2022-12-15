@@ -75,7 +75,7 @@ class MainTest {
           // the second write will actually trigger the sending of response headers and some chunked body
           // content and this response SHOULD be isSent() TRUE and no longer able to be reset()
           outputStream.write("MoreContent".getBytes(StandardCharsets.ISO_8859_1));
-          // error occurs after writing ONCE to outputStream (but not twice, not os.flush() and not os.close()
+          // error occurs after isSent TRUE and not recoverable
           throw new RuntimeException("Error After res.outputStream() called");
         })
         .error(Exception.class, (req, res, e) -> {
