@@ -13,13 +13,17 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MainTest {
 
   public static void main(String[] args) {
     int port = new MyServer().port(8081).run();
     System.out.println("Running on port " + port);
-    // curl -v http://localhost:8081/bad
+    // curl -v http://localhost:8081/good
+    // curl -v http://localhost:8081/outputStream-noWrites-thenError
+    // curl -v http://localhost:8081/outputStream-1write-still-recoverable
+    // curl -v http://localhost:8081/outputStream-2writes-not-recoverable
   }
 
   static class MyServer {
@@ -38,11 +42,40 @@ class MainTest {
           res.header("main-handler-header", "a");
           res.send("good".getBytes(StandardCharsets.UTF_8));
         })
-        .get("bad", (req, res) -> {
+        .get("good-chunked", (req, res) -> {
+          res.status(Http.Status.OK_200).header("Content-Type", "text/plain");
+          try (OutputStream os = res.outputStream()) {
+            os.write("SomeContent".getBytes(StandardCharsets.ISO_8859_1));
+            os.write("MoreContent".getBytes(StandardCharsets.ISO_8859_1));
+          }
+        })
+        .get("outputStream-noWrites-thenError", (req, res) -> {
           res.status(Http.Status.OK_200);
           res.header("main-handler-header", "a");
           OutputStream outputStream = res.outputStream();
           // error occurs before writing content to outputStream
+          throw new RuntimeException("Error After res.outputStream() called");
+        })
+        .get("outputStream-1write-still-recoverable", (req, res) -> {
+          res.status(Http.Status.OK_200);
+          res.header("main-handler-header", "a");
+          OutputStream outputStream = res.outputStream();
+          // the first write doesn't send but held as firstBuffer which is still recoverable from
+          outputStream.write("SomeContent".getBytes(StandardCharsets.UTF_8));
+          // error occurs after writing ONCE to outputStream - but not twice + no os.flush() + no os.close()
+          throw new RuntimeException("Error After res.outputStream() called");
+        })
+        .get("outputStream-2writes-not-recoverable", (req, res) -> {
+          res.status(Http.Status.OK_200);
+          res.header("Content-Type", "text/plain");
+          res.header("main-handler-header", "a");
+          OutputStream outputStream = res.outputStream();
+          // the first write doesn't send but held as firstBuffer which is still recoverable from
+          outputStream.write("SomeContent".getBytes(StandardCharsets.ISO_8859_1));
+          // the second write will actually trigger the sending of response headers and some chunked body
+          // content and this response SHOULD be isSent() TRUE and no longer able to be reset()
+          outputStream.write("MoreContent".getBytes(StandardCharsets.ISO_8859_1));
+          // error occurs after writing ONCE to outputStream (but not twice, not os.flush() and not os.close()
           throw new RuntimeException("Error After res.outputStream() called");
         })
         .error(Exception.class, (req, res, e) -> {
@@ -93,18 +126,62 @@ class MainTest {
   }
 
   @Test
-  void bad_expect_418AndErrorHandlerBody() {
+  void outputStream_noWritesThenError_expect_418AndErrorHandlerBody() {
     MyServer myServer = new MyServer();
     try {
       int port = myServer.run();
       var httpClient = httpClient(port);
 
-      HttpResponse<String> badResponse = httpClient.request().path("bad").GET().asString();
+      HttpResponse<String> badResponse = httpClient.request().path("outputStream-noWrites-thenError").GET().asString();
       // we hope to get our error handler response, but we don't get it due to internal error
       assertThat(badResponse.statusCode()).isEqualTo(418); // Fail: Get 500
       assertThat(badResponse.body()).isEqualTo("MyErrorMessage");
       assertThat(badResponse.headers().firstValue("main-handler-header")).isEmpty();
       assertThat(badResponse.headers().firstValue("error-handler-header")).isPresent().get().isEqualTo("b");
+
+    } finally {
+      myServer.stop();
+    }
+  }
+
+  @Test
+  void outputStream_1writeThenError_expect_ErrorHandlerBody_asStillRecoverable() {
+    MyServer myServer = new MyServer();
+    try {
+      int port = myServer.run();
+      var httpClient = httpClient(port);
+
+      HttpResponse<String> badResponse = httpClient.request().path("outputStream-1write-still-recoverable").GET().asString();
+      // we hope to get our error handler response, but we don't get it due to internal error
+      assertThat(badResponse.statusCode()).isEqualTo(418); // Fail: Get 500
+      assertThat(badResponse.body()).isEqualTo("MyErrorMessage");
+      assertThat(badResponse.headers().firstValue("main-handler-header")).isEmpty();
+      assertThat(badResponse.headers().firstValue("error-handler-header")).isPresent().get().isEqualTo("b");
+
+      // note: this test passes if isSent() is implemented as below [and ServerResponse.reset() exists and is called]
+      //      @Override
+      //      public boolean isSent() {
+      //        return isSent || outputStream.totalBytesWritten() > 0;
+      //      }
+
+    } finally {
+      myServer.stop();
+    }
+  }
+
+  /**
+   * All good and as expected here.
+   */
+  @Test
+  void outputStream_2writesThenError_expect_nonRecoverable_ClientGetsIOException_asServerClosesConnection() {
+    MyServer myServer = new MyServer();
+    try {
+      int port = myServer.run();
+      var httpClient = httpClient(port);
+
+      assertThatThrownBy(() -> httpClient.request().path("outputStream-2writes-not-recoverable").GET().asString())
+        .isInstanceOf(io.avaje.http.client.HttpException.class)
+        .hasCauseInstanceOf(IOException.class);
 
     } finally {
       myServer.stop();
